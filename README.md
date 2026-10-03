@@ -27,7 +27,15 @@ flowchart LR
 
 ## Measured results
 
-From a run on a 2-vCPU Linux container, with the database on the same box:
+**Verified in GitHub Actions** (standard `ubuntu-latest` runner; numbers are in each run's job summary):
+
+| What | Result |
+|---|---|
+| Full path, edge → MQTT → bridge → **Kafka** → consumer group → TimescaleDB | **588 rows/s sustained** (simulators produce 603/s; the remainder is in-flight batches), API returned live MODBUS metrics |
+| DB write path benchmark, 100k rows | **~32,400 rows/s**, batch p50 47 ms / p95 90 ms / p99 130 ms |
+| Replayed batch | **0 duplicate rows** |
+
+**Local development run** on a 2-vCPU Linux container, with the database on the same box:
 
 | What | Result |
 |---|---|
@@ -39,10 +47,10 @@ From a run on a 2-vCPU Linux container, with the database on the same box:
 | API latency, 1-min series from the continuous aggregate | 18 ms |
 | API security probes | no key → 401, wrong key → 401, SQL injection in path → 422, 30-day window → 422 |
 
-The Kafka hop (bridge → broker → consumer group) runs in the `e2e-compose` CI job.
-The local run above fed the database through `scripts/dev_mqtt_sink.py`, which uses
-the same validator and the same `write_batch`, because that environment could not
-pull broker images. `bench_ingest` re-runs in CI and writes its numbers to the job summary.
+The local run fed the database through `scripts/dev_mqtt_sink.py` (same validator, same
+`write_batch`) because that environment could not pull broker images. The Kafka path is
+covered by the `e2e-compose` CI job above, which fails the build unless rows arrive through
+Kafka at a sustained rate and the API enforces auth.
 
 ## Design decisions
 
