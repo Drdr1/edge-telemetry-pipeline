@@ -1,5 +1,7 @@
 # edge-telemetry-pipeline
 
+[![ci](https://github.com/Drdr1/edge-telemetry-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/Drdr1/edge-telemetry-pipeline/actions/workflows/ci.yml)
+
 Reference implementation of a real-time telemetry platform: industrial edge devices
 (MQTT sensors and a MODBUS/TCP PLC) streamed through Kafka into TimescaleDB, with a
 Dagster batch layer, an open-data source, data-quality checks, and a secured read API.
