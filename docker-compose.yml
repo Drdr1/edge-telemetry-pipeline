@@ -1,0 +1,128 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports: ["1883:1883"]
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "hc", "-W", "3"]
+      interval: 5s
+      retries: 10
+
+  redpanda:
+    # Kafka-API compatible broker; swap for Confluent/MSK/Pub/Sub via the same producer/consumer code
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    ports: ["9092:9092"]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      retries: 20
+
+  redpanda-init:
+    # Topics are created explicitly (no auto-create): 6 partitions keyed by device_id,
+    # 7-day retention on the main topic so consumers can replay after an outage.
+    image: redpandadata/redpanda:v24.2.7
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >
+        rpk topic create telemetry.readings -p 6 -c retention.ms=604800000 -X brokers=redpanda:9092 || true;
+        rpk topic create telemetry.readings.dlq -p 1 -X brokers=redpanda:9092 || true
+    depends_on:
+      redpanda: { condition: service_healthy }
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: telemetry
+      POSTGRES_PASSWORD: telemetry
+      POSTGRES_DB: telemetry
+    ports: ["5432:5432"]
+    volumes:
+      - ./sql/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      - tsdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telemetry"]
+      interval: 5s
+      retries: 10
+
+  modbus-sim:
+    # PLC stand-in exposing holding registers on TCP/5020
+    build: { context: ., dockerfile: Dockerfile }
+    command: python -m edge.modbus_server
+    ports: ["5020:5020"]
+
+  edge-simulator:
+    build: { context: ., dockerfile: Dockerfile }
+    command: python -m edge.mqtt_simulator
+    environment:
+      MQTT_HOST: mosquitto
+      DEVICE_COUNT: "20"
+      HZ: "10"
+    depends_on:
+      mosquitto: { condition: service_healthy }
+
+  modbus-poller:
+    build: { context: ., dockerfile: Dockerfile }
+    command: python -m edge.modbus_poller
+    environment:
+      MQTT_HOST: mosquitto
+      MODBUS_HOST: modbus-sim
+    depends_on:
+      mosquitto: { condition: service_healthy }
+      modbus-sim: { condition: service_started }
+
+  bridge:
+    build: { context: ., dockerfile: Dockerfile }
+    command: python -m bridge.mqtt_to_kafka
+    environment:
+      MQTT_HOST: mosquitto
+      KAFKA_BOOTSTRAP: redpanda:9092
+    depends_on:
+      mosquitto: { condition: service_healthy }
+      redpanda-init: { condition: service_completed_successfully }
+
+  stream-consumer:
+    build: { context: ., dockerfile: Dockerfile }
+    command: python -m stream.consumer
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      DATABASE_URL: postgresql://telemetry:telemetry@timescaledb:5432/telemetry
+    depends_on:
+      redpanda-init: { condition: service_completed_successfully }
+      timescaledb: { condition: service_healthy }
+    deploy:
+      replicas: 2   # same consumer group -> partitions split across replicas
+
+  dagster:
+    build: { context: ., dockerfile: Dockerfile }
+    command: dagster dev -m pipelines -h 0.0.0.0 -p 3000
+    environment:
+      DATABASE_URL: postgresql://telemetry:telemetry@timescaledb:5432/telemetry
+      DAGSTER_HOME: /app/.dagster
+    ports: ["3000:3000"]
+    depends_on:
+      timescaledb: { condition: service_healthy }
+
+  api:
+    build: { context: ., dockerfile: Dockerfile }
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql://telemetry:telemetry@timescaledb:5432/telemetry
+      API_KEYS: "dev-key-change-me"
+    ports: ["8000:8000"]
+    depends_on:
+      timescaledb: { condition: service_healthy }
+
+volumes:
+  tsdata:
